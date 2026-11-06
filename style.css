@@ -60,7 +60,8 @@ body.stmsg-anchor-restore.stmsg-reading-lock #chat > * {
     transition: opacity 140ms ease;
 }
 
-body.stmsg-reading-lock #stmsg-badge {
+/* 按钮在「生成中」整个窗口内常驻：锁定中显示拦截计数，解除后显示「点此恢复」 */
+body.stmsg-window #stmsg-badge {
     display: flex;
     opacity: 1;
 }

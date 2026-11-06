@@ -48,7 +48,7 @@ const USER_QUIET_MS = 220;
 /** 自己写 scrollTop 之后这段时间内的 scroll 事件不算用户滚动 */
 const SELF_SCROLL_MS = 150;
 /** 距底部多少像素以内算「在底部」——在底部就完全不插手 */
-const BOTTOM_TOLERANCE = 64;
+const BOTTOM_TOLERANCE = 40;
 /** 锚点漂移超过这么多像素才补 */
 const ANCHOR_TOLERANCE = 1.5;
 
@@ -60,6 +60,7 @@ const DEFAULTS = {
     reenableScrollAnchor: true,
     fixChatHeight: true,
     showBadge: true,
+    autoRelockAtBottom: true,
     debug: false,
 };
 
@@ -75,6 +76,7 @@ const state = {
     lastUserInputAt: 0,
     lastScrollAt: 0,
     selfScrollUntil: 0,
+    expectedScrollTop: null,
     writing: false,
     rafId: 0,
     previousInlineScrollBehavior: null,
@@ -82,7 +84,13 @@ const state = {
     corrections: 0,
     engagements: 0,
     lastBlockedKind: '',
+    blockedStacks: [],
     badgeEl: null,
+    badgeText: '',
+    windowClassOn: false,
+    msgObserver: null,
+    observedMes: null,
+    lastScrollTop: 0,
     boundChats: new WeakSet(),
 };
 
@@ -245,7 +253,32 @@ function shouldBlockWrite(el) {
         return false;
     }
     // 只挡 #chat 这个滚动容器；页面级滚动交给 CSS 处理，避免误伤
-    return el.id === 'chat';
+    if (el.id !== 'chat') {
+        return false;
+    }
+    rememberWriteStack();
+    return true;
+}
+
+/** 记住前几次拦截的调用栈（诊断面板里能看到是谁在抢位置） */
+function rememberWriteStack() {
+    if (state.blockedStacks.length >= 5) {
+        return;
+    }
+    let stack = '';
+    try {
+        stack = String(new Error().stack || '');
+    } catch {
+        stack = '';
+    }
+    const frames = stack
+        .split('\n')
+        .slice(1)
+        .map((line) => line.trim())
+        .filter((line) => line && !/stmsg|index\.js\?/i.test(line) && !/shouldBlockWrite|rememberWriteStack/.test(line))
+        .slice(0, 4)
+        .join(' <- ');
+    state.blockedStacks.push(frames || '(无栈信息)');
 }
 
 /** 绕过我们自己的拦截，写一次 scrollTop */
@@ -261,6 +294,10 @@ function writeScrollTop(chat, value) {
     } finally {
         state.writing = false;
     }
+    // 记下「这次写完之后应该停在哪」：用来区分「我们自己写的 scroll」和「用户真的在滑」。
+    // 早先用时间窗（150ms）来猜，结果流式期间我们几乎每帧都在补位置，
+    // 时间窗永远新鲜 → 用户的手势全被当成自己的写入吞掉，锁定就变成了「怎么滑都被拽回去」。
+    state.expectedScrollTop = chat.scrollTop;
     state.selfScrollUntil = now() + SELF_SCROLL_MS;
 }
 
@@ -391,6 +428,7 @@ function disengage(reason) {
 
 function tick() {
     state.rafId = 0;
+    refreshUi();
 
     if (!isActive() || !inWindow() || state.forceUnlocked) {
         disengage('window-ended');
@@ -402,6 +440,7 @@ function tick() {
         disengage('no-chat');
         return;
     }
+    ensureMessageObserver();
 
     // 在底部 = 让 ST 自己跟随，完全不插手
     if (atBottom(chat)) {
@@ -445,14 +484,58 @@ function schedule() {
 function startWindow() {
     state.forceUnlocked = false;
     ensureChatScrollListener();
+    ensureMessageObserver();
     if (!state.rafId && isActive()) {
         schedule();
     }
+    refreshUi();
 }
 
 function endWindow(delayMs = GRACE_AFTER_GENERATION_MS) {
     state.windowUntil = Math.max(Number(state.windowUntil || 0), now() + delayMs);
     schedule();
+    refreshUi();
+}
+
+/**
+ * 「是否在守护窗口内」决定提示按钮是否存在。
+ * 按钮在窗口内一直在：锁定中 = 点一下解除；已解除 = 点一下重新锁定。
+ * 早先版本只在锁定时显示按钮，用户一点解除按钮就消失、本次生成内再也回不来，
+ * 这里改成窗口内常驻 + 双向切换。
+ */
+function refreshUi() {
+    if (!document.body) {
+        return;
+    }
+    const open = Boolean(settings.enabled && isActive() && inWindow());
+    if (open !== state.windowClassOn) {
+        state.windowClassOn = open;
+        document.body.classList.toggle('stmsg-window', open);
+    }
+    if (open) {
+        updateBadge();
+    }
+}
+
+/** 提示按钮：空 = 无；锁定中 / 已解除 两态互相切换 */
+function toggleLock() {
+    if (state.forceUnlocked) {
+        state.forceUnlocked = false;
+        const chat = chatEl();
+        if (chat && !atBottom(chat)) {
+            engage('user-relock');
+        }
+        if (inWindow()) {
+            startWindow(); // 重新跑起来（内部会把 forceUnlocked 清掉并刷新按钮）
+        }
+        refreshUi();
+        log('用户重新锁定');
+        return;
+    }
+    state.forceUnlocked = true;
+    disengage('user-released');
+    refreshUi();
+    log('用户手动解除锁定');
 }
 
 /* ------------------------------------------------------------------ */
@@ -481,9 +564,12 @@ function onChatScroll(event) {
     if (event.target !== chat) {
         return;
     }
-    if (now() < Number(state.selfScrollUntil || 0)) {
-        return; // 我们自己写的，不算用户滚动
+    // 我们自己刚写的位置（容差 2px）算自己的滚动，其余一律当成用户在滑
+    if (state.expectedScrollTop !== null && Math.abs(chat.scrollTop - state.expectedScrollTop) <= 2) {
+        state.expectedScrollTop = null;
+        return;
     }
+    state.expectedScrollTop = null;
     state.lastScrollAt = now();
 
     if (!isActive()) {
@@ -493,6 +579,11 @@ function onChatScroll(event) {
     if (atBottom(chat)) {
         disengage('user-at-bottom');
         rebaseline(chat);
+        // 用户滑回底部看新内容：下一次再往上翻时重新自动锁定
+        if (state.forceUnlocked && settings.autoRelockAtBottom) {
+            state.forceUnlocked = false;
+            refreshUi();
+        }
         return;
     }
 
@@ -509,6 +600,38 @@ function ensureChatScrollListener() {
     }
     chat.addEventListener('scroll', onChatScroll, { passive: true });
     state.boundChats.add(chat);
+}
+
+/**
+ * 守住「正在输出的那条消息」。
+ * 流式输出每个 token 都会整块换掉消息体，浏览器可能因为高度/占位估算变化
+ * 自己把滚动位置挪走——这种位移没有 scrollTop 写入可以拦，只能靠观察 DOM 变化
+ * 之后立刻补位置。观察对象是最后一条 .mes 的子树，开销很小。
+ */
+function ensureMessageObserver() {
+    const chat = chatEl();
+    if (!chat) {
+        return;
+    }
+    const mesList = chat.querySelectorAll('.mes[mesid]');
+    const last = mesList.length ? mesList[mesList.length - 1] : null;
+    if (last === state.observedMes && last && last.isConnected) {
+        return;
+    }
+    if (state.msgObserver) {
+        state.msgObserver.disconnect();
+        state.msgObserver = null;
+    }
+    state.observedMes = last;
+    if (!last || typeof MutationObserver !== 'function') {
+        return;
+    }
+    state.msgObserver = new MutationObserver(() => {
+        if (state.locked) {
+            schedule(); // 下一帧就会跑 restoreAnchor
+        }
+    });
+    state.msgObserver.observe(last, { childList: true, subtree: true, characterData: true });
 }
 
 function bindDomEvents() {
@@ -584,16 +707,13 @@ function ensureBadge() {
     }
     const badge = document.createElement('div');
     badge.id = BADGE_ID;
-    badge.title = '手机流式滚动守护';
-    badge.textContent = '🔒 已锁定阅读位置 · 点此解除';
+    badge.setAttribute('role', 'button');
+    badge.title = '手机流式滚动守护：点一下在「锁定 / 解除」之间切换';
+    badge.textContent = '🔒 锁定中';
     badge.addEventListener('click', (event) => {
         event.preventDefault();
         event.stopPropagation();
-        state.forceUnlocked = true;
-        disengage('user-released');
-        badge.classList.add('stmsg-badge-off');
-        badge.textContent = '🔓 本次生成已解除锁定';
-        log('用户手动解除锁定');
+        toggleLock();
     });
     document.body.appendChild(badge);
     state.badgeEl = badge;
@@ -610,9 +730,21 @@ function updateBadge() {
         return;
     }
     badge.style.display = '';
-    if (state.locked) {
+
+    let text;
+    if (state.forceUnlocked) {
+        badge.classList.add('stmsg-badge-off');
+        text = '🔓 已解除 · 点此恢复';
+    } else if (state.locked) {
         badge.classList.remove('stmsg-badge-off');
-        badge.textContent = '🔒 已锁定阅读位置 · 点此解除';
+        text = `🔒 锁定中 · 已拦 ${state.blockedWrites}`;
+    } else {
+        badge.classList.remove('stmsg-badge-off');
+        text = '🔒 待锁定 · 点此解除';
+    }
+    if (text !== state.badgeText) {
+        state.badgeText = text;
+        badge.textContent = text;
     }
 }
 
@@ -628,6 +760,7 @@ const PANEL_ROWS = [
     ['reenableScrollAnchor', '恢复浏览器原生滚动锚定（推荐）'],
     ['fixChatHeight', '修正手机端 #chat 高度（100vh → 100dvh）'],
     ['showBadge', '显示锁定提示按钮'],
+    ['autoRelockAtBottom', '滑回底部后自动恢复守护'],
     ['debug', '调试日志（控制台）'],
 ];
 
@@ -727,6 +860,7 @@ function buildPanel() {
             位置补偿次数: state.corrections,
             进入锁定次数: state.engagements,
             最近拦截类型: state.lastBlockedKind || '无',
+            拦截调用栈: state.blockedStacks.slice(),
             锚点消息: state.anchorEl instanceof Element ? String(state.anchorEl.getAttribute('mesid')) : '无',
             长聊天优化是否开: Boolean(chat && chat.classList.contains('bai-bai-toolkit-long-chat-render-optimized')),
         };
