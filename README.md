@@ -37,6 +37,9 @@
 
 ## 三、安装
 
+> 仓库：https://github.com/y145-cloud/sillytavern-mobile-scroll-guard （私有）
+> 更新：进目录 `git pull` 即可；本扩展不写 ST 设置文件，升级不会动你的设置。
+
 ### 方法 A：解压到扩展目录（推荐，最稳）
 
 把整个 `st-mobile-scroll-guard` 文件夹放到：
