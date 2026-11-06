@@ -51,6 +51,14 @@ const SELF_SCROLL_MS = 150;
 const BOTTOM_TOLERANCE = 40;
 /** 锚点漂移超过这么多像素才补 */
 const ANCHOR_TOLERANCE = 1.5;
+/** 手指/滚轮最后一次动作之后，多久之内产生的 scroll 事件算「用户自己在滑」 */
+const GESTURE_HOLD_MS = 300;
+/** 惯性滚动是「连续事件链」：相邻两次间隔小于这个值就认为还在同一次手势里 */
+const SCROLL_CHAIN_GAP_MS = 150;
+/** 锁定时，没有手指却一口气挪了这么多像素，判定为「被抢位置」并回退 */
+const JUMP_MIN_PX = 120;
+/** 一次性位移超过视口高度的这个比例，即使还在惯性链里也判为跳转 */
+const JUMP_VIEWPORT_RATIO = 0.45;
 
 const DEFAULTS = {
     enabled: true,
@@ -61,6 +69,7 @@ const DEFAULTS = {
     fixChatHeight: true,
     showBadge: true,
     autoRelockAtBottom: true,
+    revertJumps: true,
     debug: false,
 };
 
@@ -91,6 +100,16 @@ const state = {
     msgObserver: null,
     observedMes: null,
     lastScrollTop: 0,
+    /** 最近一次「确认是用户自己滑」的 scroll 事件时间，用来串起惯性滚动链 */
+    userScrollChainAt: 0,
+    /** 最近一次我们认可的滚动位置（用户停下的位置 / 我们自己写完的位置） */
+    lastConfirmedTop: 0,
+    /** 上一次看到的 scrollTop，用来算单次位移有多大 */
+    lastSeenScrollTop: null,
+    /** 被判定为「抢位置」并回退的次数 */
+    jumpsReverted: 0,
+    /** 最近一次回退的位移（正数=被往下拽，负数=被往上拽） */
+    lastRevertPx: 0,
     boundChats: new WeakSet(),
 };
 
@@ -299,6 +318,8 @@ function writeScrollTop(chat, value) {
     // 时间窗永远新鲜 → 用户的手势全被当成自己的写入吞掉，锁定就变成了「怎么滑都被拽回去」。
     state.expectedScrollTop = chat.scrollTop;
     state.selfScrollUntil = now() + SELF_SCROLL_MS;
+    state.lastConfirmedTop = chat.scrollTop;
+    state.lastSeenScrollTop = chat.scrollTop;
 }
 
 /* ------------------------------------------------------------------ */
@@ -337,10 +358,36 @@ function captureAnchor(chat) {
 function rebaseline(chat) {
     if (!(state.anchorEl instanceof HTMLElement) || !state.anchorEl.isConnected) {
         captureAnchor(chat);
-        return;
+    } else {
+        const chatRect = chat.getBoundingClientRect();
+        state.anchorOffset = state.anchorEl.getBoundingClientRect().top - chatRect.top;
     }
-    const chatRect = chat.getBoundingClientRect();
-    state.anchorOffset = state.anchorEl.getBoundingClientRect().top - chatRect.top;
+    state.lastConfirmedTop = chat.scrollTop;
+    state.lastSeenScrollTop = chat.scrollTop;
+}
+
+/**
+ * 把「没有手指参与、却突然挪走」的位置退回去。
+ * TauriTavern 的虚拟化会把 #chat 的内容换成 spacer + 已挂载的消息，
+ * 重新测量高度时会先 scrollToIndex(消息开头) 再补偏移（见它的
+ * bounded-chat-surface.js / tanstack-virtual-adapter.js scrollToAnchor）；
+ * 偏移一丢就正好停在「本楼第一行」。这种位移走的是浏览器自己的锚定或
+ * scrollTo，拦 setter 拦不住，只能在 scroll 事件里发现并退回去。
+ */
+function revertJump(chat, movedBy) {
+    if (!settings.revertJumps || state.writing) {
+        return false;
+    }
+    const target = Number(state.lastConfirmedTop);
+    if (!Number.isFinite(target)) {
+        return false;
+    }
+    writeScrollTop(chat, target);
+    state.jumpsReverted += 1;
+    state.lastRevertPx = Math.round(movedBy);
+    rebaseline(chat);
+    log('回退跳转:', movedBy, 'px →', target);
+    return true;
 }
 
 function restoreAnchor(chat) {
@@ -388,6 +435,8 @@ function engage(reason) {
     state.locked = true;
     state.engagements += 1;
     captureAnchor(chat);
+    state.lastConfirmedTop = chat.scrollTop;
+    state.lastSeenScrollTop = chat.scrollTop;
 
     if (settings.fixChatHeight) {
         try {
@@ -467,7 +516,19 @@ function tick() {
         }
     }
 
+    // 兜底：锁定时位置不该莫名其妙变。变了就是被抢（锚定/重排/spacer），退回去。
+    if (settings.revertJumps && !state.writing
+        && Math.abs(chat.scrollTop - Number(state.lastConfirmedTop || 0)) > 2) {
+        revertJump(chat, chat.scrollTop - Number(state.lastConfirmedTop || 0));
+    }
+
     restoreAnchor(chat);
+
+    // 每一帧都刷新基准：防止「基准落后于真实阅读位置」导致回退时跳回几百像素以前
+    // （页面被节流时尤其明显）。检测已经在上面做过，这里刷新不会放过下一帧的跳转。
+    state.lastConfirmedTop = chat.scrollTop;
+    state.lastSeenScrollTop = chat.scrollTop;
+
     schedule();
 }
 
@@ -564,13 +625,43 @@ function onChatScroll(event) {
     if (event.target !== chat) {
         return;
     }
-    // 我们自己刚写的位置（容差 2px）算自己的滚动，其余一律当成用户在滑
+    const t = now();
+
+    // 我们自己刚写的位置（容差 2px）算自己的滚动
     if (state.expectedScrollTop !== null && Math.abs(chat.scrollTop - state.expectedScrollTop) <= 2) {
         state.expectedScrollTop = null;
+        state.lastSeenScrollTop = chat.scrollTop;
         return;
     }
     state.expectedScrollTop = null;
-    state.lastScrollAt = now();
+
+    const prevTop = state.lastSeenScrollTop;
+    const delta = prevTop === null ? 0 : chat.scrollTop - prevTop;
+    state.lastSeenScrollTop = chat.scrollTop;
+
+    // ── 判断这一跳到底是「用户在滑」还是「被别人挪走」 ──────────────
+    // 用户滑动一定伴随 touchmove/wheel/pointer 事件，或者紧跟在这样一次事件
+    // 之后（惯性）。两者都没有、位移却很大 —— 那就是跳转，回退它。
+    const hasFreshGesture = t - Number(state.lastUserInputAt || 0) < GESTURE_HOLD_MS;
+    const inChain = t - Number(state.userScrollChainAt || 0) < SCROLL_CHAIN_GAP_MS;
+    const jumpThreshold = Math.max(JUMP_MIN_PX, chat.clientHeight * JUMP_VIEWPORT_RATIO);
+    const bigJump = Math.abs(delta) > jumpThreshold;
+
+    if (state.locked && !hasFreshGesture && (bigJump || !inChain)) {
+        if (revertJump(chat, delta)) {
+            schedule();
+            return;
+        }
+    }
+
+    if (hasFreshGesture || inChain) {
+        // 真·用户滚动：把惯性链续上
+        state.userScrollChainAt = t;
+        state.lastScrollAt = t;
+        state.lastConfirmedTop = chat.scrollTop;
+    } else {
+        state.lastConfirmedTop = chat.scrollTop;
+    }
 
     if (!isActive()) {
         return;
@@ -761,6 +852,7 @@ const PANEL_ROWS = [
     ['fixChatHeight', '修正手机端 #chat 高度（100vh → 100dvh）'],
     ['showBadge', '显示锁定提示按钮'],
     ['autoRelockAtBottom', '滑回底部后自动恢复守护'],
+    ['revertJumps', '跳走了就退回去（无手势参与时）'],
     ['debug', '调试日志（控制台）'],
 ];
 
@@ -858,6 +950,9 @@ function buildPanel() {
             scrollTop: chat ? Math.round(chat.scrollTop) : null,
             拦截写入次数: state.blockedWrites,
             位置补偿次数: state.corrections,
+            回退跳转次数: state.jumpsReverted,
+            最近回退px: state.lastRevertPx,
+            当前确认位置: Math.round(Number(state.lastConfirmedTop || 0)),
             进入锁定次数: state.engagements,
             最近拦截类型: state.lastBlockedKind || '无',
             拦截调用栈: state.blockedStacks.slice(),
@@ -923,10 +1018,14 @@ function boot() {
         state,
         engage,
         disengage,
+        tick, // 调试/测试用：页面被节流时可手动推进一帧
         report: () => ({
             locked: state.locked,
             blockedWrites: state.blockedWrites,
             corrections: state.corrections,
+            jumpsReverted: state.jumpsReverted,
+            lastRevertPx: state.lastRevertPx,
+            lastConfirmedTop: Math.round(Number(state.lastConfirmedTop || 0)),
             engagements: state.engagements,
         }),
     };

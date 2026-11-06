@@ -15,6 +15,7 @@
 | 1 | 柏宝箱 ST-BaiBai-Tools 的「生成结束定位到最新消息开头」 | 生成结束时把 `#chat.scrollTop` 设成「最新一条消息的开头」放到离顶部 18% 的位置（`LATEST_MESSAGE_TOP_OFFSET_RATIO = 0.18`）。这个目标位置**字面上就是本楼开头**。 |
 | 2 | 柏宝箱的「长聊天渲染优化」 | 生成期间给 `#chat` 子元素加 `overflow-anchor: none`，关掉浏览器原生滚动锚定；同时给消息加 `content-visibility: auto` + `contain-intrinsic-size`。手机 Chrome/WebView 上占位高度估算会来回变，又没有锚定补偿 → 内容自己往上/往下跳。 |
 | 3 | SillyTavern 核心的 `#chat` 高度 | `public/style.css` 里是 `max-height: calc(100vh - ...)`，用 `100vh` 而不是 `100dvh`。手机地址栏伸缩时 `#chat` 比可视区高，滚动会链到整个页面上，手势判定和 scrollTop 基准全乱。上游 PR #6060 正是修这个。 |
+| 4 | **TauriTavern 的有界虚拟化渲染**（TT 用户的主因） | TT 把聊天做成虚拟列表：内容一变就重新测量高度，然后 `bounded-chat-surface.js` 的 `commitMeasurementRefresh()` 取锚点 → `virtual.scrollToAnchor(messageId, offset)`；适配器 `tanstack-virtual-adapter.js` 里是先 `scrollToIndex(messageId, 'start')`（把这楼开头顶到视口顶部）再补 `boundedOffset`，而 `boundedOffset` 会被 `Math.min(offset, item.size - 1)` clamp 成 0。偏移一丢，落点就是本楼第一行。这条路不走 `scrollTop` 赋值的主路径（或发生在未锁定时），拦不住，只能「挪走了就退回去」。 |
 
 另外 ST 核心默认 `stream_fade_in = false` 时，每个 token 都是整块 `innerHTML` 替换（`public/script.js` 的 `StreamingProcessor`），文本节点每帧重建一次 —— 所以**任何按文本节点记位置的方案都会失效**，本扩展用消息元素 `.mes` 当锚点。
 
@@ -62,7 +63,7 @@
 [STMSG] 已加载 { touch: true, settings: {...} }
 ```
 
-扩展设置面板（魔棒图标 → 扩展）里能看到「手机流式滚动守护」，共 9 个开关。
+扩展设置面板（魔棒图标 → 扩展）里能看到「手机流式滚动守护」，共 10 个开关。
 
 ---
 
@@ -78,6 +79,7 @@
 | 修正手机端 #chat 高度 | ✅ | `100vh` → `100dvh` |
 | 显示锁定提示按钮 | ✅ | 右下角小胶囊：锁定中显示拦截计数，点一下解除；再点一下恢复 |
 | 滑回底部后自动恢复守护 | ✅ | 你滑到底部看新内容时清除「手动解除」，下次上翻重新锁定 |
+| 跳走了就退回去 | ✅ | 检测到位置被瞬间挪走（不是你手指划的）就恢复原处，专门防 TauriTavern 的虚拟化重排 |
 | 调试日志 | ⬜ | 控制台打印拦截/补偿细节 |
 
 面板里还有「诊断」按钮，输出当前状态 JSON：距底部像素、拦截次数、补偿次数、锚点消息、柏宝箱长聊天优化是否在生效等。
@@ -85,7 +87,7 @@
 排查用命令（控制台）：
 
 ```js
-window.stMobileScrollGuard.report()   // { locked, blockedWrites, corrections, engagements }
+window.stMobileScrollGuard.report()   // { locked, blockedWrites, corrections, jumpsReverted, lastRevertPx, lastConfirmedTop, engagements }
 window.stMobileScrollGuard.settings   // 运行时设置（改完记得面板里点一下，或用 saveSettings）
 ```
 
@@ -103,6 +105,17 @@ window.stMobileScrollGuard.settings   // 运行时设置（改完记得面板里
 
 ## 六、更新日志
 
+- **1.2.0**
+  - 修掉**「跳回本楼第一行」**的真正元凶：TauriTavern 用的是有界虚拟化渲染，重新测量高度时走
+    `bounded-chat-surface.js` → `scrollToAnchor()` → `tanstack-virtual-adapter.js` 的
+    `scrollToIndex(messageId, 'start')` 先把这一楼的开头对到视口顶部，再补偏移；偏移一旦被
+    clamp 成 0（或消息重新测量后变短），落点就正好是本楼第一行。这种位移不走 `scrollTop` 赋值
+    的主路径，setter 拦截拦不住，所以加了「**发现被挪走就退回去**」。
+  - 新增「跳走了就退回去」：没有手指参与、位移超过 `max(120px, 视口 45%)` 或不属于当前滚动惯性，
+    就直接写回上一帧确认的位置（`revertJump`），并统计到诊断的「回退跳转次数 / 最近回退px」。
+  - 每帧刷新「确认位置」基准，避免基准落后于真实阅读位置 → 回退时反而跳回几百像素以前。
+  - 输入判定引入手势保持窗口（300ms）与惯性链（150ms），保证你自己的快速滑动、甩动不会被当成跳转退回。
+  - 调试 API 增 `tick`、`jumpsReverted`、`lastRevertPx`、`lastConfirmedTop`。
 - **1.1.0**
   - 修掉「点一下解除后按钮消失、本次生成内再也锁不回来」：按钮改为**生成期间常驻、双向切换**（锁定中 ↔ 已解除）。
   - 修掉锁定期间**误吞用户手势**的 bug：以前用 150ms 时间窗判断「是不是自己写的 scroll」，流式时几乎每帧都在补位置、时间窗永远新鲜，结果用户滑动全被当成自己的写入 → 表现为「怎么滑都被拽回去」。现在改为比对写入后的目标位置（±2px）。
