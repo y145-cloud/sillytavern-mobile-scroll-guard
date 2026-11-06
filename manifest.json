@@ -1,0 +1,12 @@
+{
+    "display_name": "手机流式滚动守护 (Mobile Scroll Guard)",
+    "loading_order": 90,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "DSH",
+    "version": "1.0.1",
+    "homePage": "",
+    "auto_update": false
+}

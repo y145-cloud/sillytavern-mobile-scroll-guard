@@ -1,0 +1,122 @@
+/* ============================================================
+   手机流式滚动守护 — 样式
+   只在扩展启用（body.stmsg-enabled）时生效
+   ============================================================ */
+
+/* 1) 手机端 #chat 用动态视口高度，避免地址栏伸缩时 #chat 比可视区高、
+      整个页面跟着滚（上游 PR #6060 就是修这个） */
+@media (max-width: 1000px), (pointer: coarse) {
+    body.stmsg-height #chat {
+        max-height: calc(100dvh - (var(--topBarBlockSize, 0px) + var(--bottomFormBlockSize, 0px)));
+        overscroll-behavior-y: contain;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* 阻断 #chat 滚到底后把滚动链式传给页面（以及下拉刷新） */
+    body.stmsg-enabled {
+        overscroll-behavior-y: none;
+    }
+}
+
+/* 2) 降级：不支持 dvh 的内核用 vh */
+@supports not (height: 100dvh) {
+    @media (max-width: 1000px), (pointer: coarse) {
+        body.stmsg-height #chat {
+            max-height: calc(100vh - (var(--topBarBlockSize, 0px) + var(--bottomFormBlockSize, 0px)));
+        }
+    }
+}
+
+/* 3) 阅读锁定期间，重新打开浏览器原生滚动锚定：
+      别的扩展（如柏宝箱）会在生成期间给所有消息加 overflow-anchor: none，
+      导致流式输出时文本高度变化没有任何补偿，肉眼看到的就是「内容自己跳」 */
+body.stmsg-anchor-restore.stmsg-reading-lock #chat > * {
+    overflow-anchor: auto !important;
+}
+
+/* 4) 锁定提示按钮 */
+#stmsg-badge {
+    position: fixed;
+    right: 10px;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 96px);
+    z-index: 4000;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 11px;
+    border-radius: 999px;
+    font-size: 12px;
+    line-height: 1.2;
+    color: #fff;
+    background: rgba(24, 24, 28, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: manipulation;
+    opacity: 0;
+    transition: opacity 140ms ease;
+}
+
+body.stmsg-reading-lock #stmsg-badge {
+    display: flex;
+    opacity: 1;
+}
+
+#stmsg-badge.stmsg-badge-off {
+    background: rgba(60, 60, 66, 0.82);
+}
+
+/* 5) 设置面板 */
+.stmsg-panel .stmsg-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0;
+    font-size: 13px;
+}
+
+.stmsg-panel .stmsg-row input[type="checkbox"] {
+    margin: 0;
+    flex: 0 0 auto;
+}
+
+.stmsg-panel .stmsg-hint {
+    margin: 2px 0 10px 0;
+    font-size: 11px;
+    line-height: 1.45;
+    opacity: 0.7;
+}
+
+.stmsg-panel .stmsg-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+.stmsg-panel .stmsg-actions button {
+    padding: 5px 10px;
+    font-size: 12px;
+    border-radius: 6px;
+}
+
+.stmsg-panel pre.stmsg-diag {
+    margin-top: 8px;
+    padding: 8px;
+    max-height: 220px;
+    overflow: auto;
+    font-size: 11px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-all;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.25);
+    display: none;
+}
+
+.stmsg-panel pre.stmsg-diag.stmsg-diag-open {
+    display: block;
+}
